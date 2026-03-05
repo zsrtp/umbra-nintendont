@@ -19,7 +19,8 @@ static const char gdb_top_name[15] ALIGNED(32) = "/dev/net/ip/top";
 #define PPC_TRAP_INSN 0x7FE00008
 
 /* GDB PPC register numbering: r0-r31 (0-31), f0-f31 (32-63),
- * pc (64), msr (65), cr (66), lr (67), ctr (68), xer (69), fpscr (70) */
+ * pc (64), msr (65), cr (66), lr (67), ctr (68), xer (69), fpscr (70),
+ * padding (71-104), vr0-vr31 (105-136), vscr (137), vrsave (138) */
 #define GDB_REG_PC   64
 #define GDB_REG_MSR  65
 #define GDB_REG_CR   66
@@ -28,6 +29,14 @@ static const char gdb_top_name[15] ALIGNED(32) = "/dev/net/ip/top";
 #define GDB_REG_XER  69
 #define GDB_REG_FPSCR 70
 #define GDB_NUM_REGS 71
+
+/* Altivec/VMX register range — we don't have these but must return
+ * zeros so VSCode's register panel doesn't abort on E01. */
+#define GDB_REG_VR0     105
+#define GDB_REG_VR31    136
+#define GDB_REG_VSCR    137
+#define GDB_REG_VRSAVE  138
+#define GDB_REG_MAX     139  /* highest known + 1 */
 
 static const char hexchars[] = "0123456789abcdef";
 
@@ -106,6 +115,14 @@ static inline void shm_write64(u32 offset, u64 val)
 	sync_after_write((void*)(GDB_SHM_ADDR_ARM + offset), 8);
 }
 
+static void ic_inval_add(u32 ppc_addr)
+{
+	u32 cnt = shm_read32(GDB_SHM_OFF_IC_INVAL_CNT);
+	if (cnt >= 8) return;
+	shm_write32(GDB_SHM_OFF_IC_INVAL_ADDR + cnt * 4, ppc_addr);
+	shm_write32(GDB_SHM_OFF_IC_INVAL_CNT, cnt + 1);
+}
+
 struct breakpoint {
 	u32 addr;
 	u32 orig_insn;
@@ -159,6 +176,7 @@ static int bp_insert(u32 addr)
 
 	write32(pa, PPC_TRAP_INSN);
 	sync_after_write((void*)pa, 4);
+	ic_inval_add(addr);
 
 	return 0;
 }
@@ -173,6 +191,7 @@ static int bp_remove(u32 addr)
 			u32 pa = ppc_to_phys(addr);
 			write32(pa, bp_table[i].orig_insn);
 			sync_after_write((void*)pa, 4);
+			ic_inval_add(addr);
 			bp_table[i].active = 0;
 			return 0;
 		}
@@ -190,6 +209,7 @@ static void bp_remove_all(void)
 			u32 pa = ppc_to_phys(bp_table[i].addr);
 			write32(pa, bp_table[i].orig_insn);
 			sync_after_write((void*)pa, 4);
+			ic_inval_add(bp_table[i].addr);
 			bp_table[i].active = 0;
 		}
 	}
@@ -516,6 +536,21 @@ static int read_single_reg(int regnum, char *buf)
 		return 8;
 	}
 	default:
+		/* Unsupported registers: return zeros sized to match GDB's
+		 * target description so VSCode doesn't abort register display.
+		 * vr0-vr31 + vscr are 128-bit; padding/vrsave are 32-bit. */
+		if (regnum < GDB_REG_MAX)
+		{
+			int nchars;
+			int i;
+			if (regnum >= GDB_REG_VR0 && regnum <= GDB_REG_VSCR)
+				nchars = 32;  /* 128-bit */
+			else
+				nchars = 8;   /* 32-bit */
+			for (i = 0; i < nchars; i++)
+				buf[i] = '0';
+			return nchars;
+		}
 		return 0;
 	}
 }
@@ -547,6 +582,9 @@ static int write_single_reg(int regnum, const char *hex)
 		return 0;
 	}
 	default:
+		/* Accept writes to unsupported registers silently */
+		if (regnum < GDB_REG_MAX)
+			return 0;
 		return -1;
 	}
 }
@@ -602,14 +640,23 @@ static void do_continue(void)
 		/* Step past breakpoint: restore, step, re-insert */
 		write32(pa, orig_insn);
 		sync_after_write((void*)pa, 4);
+		ic_inval_add(pc);
 
 		shm_write32(GDB_SHM_OFF_STATE, GDB_STATE_STEP);
 
-		while (shm_read32(GDB_SHM_OFF_STATE) != GDB_STATE_STOPPED)
-			mdelay(1);
+		{
+			int step_wait = 0;
+			while (shm_read32(GDB_SHM_OFF_STATE) != GDB_STATE_STOPPED)
+			{
+				mdelay(1);
+				if (++step_wait > 3000)
+					break;  /* 3s timeout — avoid infinite hang */
+			}
+		}
 
 		write32(pa, PPC_TRAP_INSN);
 		sync_after_write((void*)pa, 4);
+		ic_inval_add(pc);
 	}
 
 	shm_write32(GDB_SHM_OFF_STATE, GDB_STATE_RESUME);
@@ -678,6 +725,8 @@ static int gdb_handle_command(const char *cmd, int len)
 			shm_write32(GDB_SHM_OFF_MAGIC, GDB_SHM_MAGIC);
 			shm_write32(GDB_SHM_OFF_HALT_REQ, 1);
 
+			u32 hb_before = shm_read32(GDB_SHM_OFF_PPC_HEARTBEAT);
+
 			int wait_ms = 0;
 			while (wait_ms < 3000)
 			{
@@ -687,6 +736,16 @@ static int gdb_handle_command(const char *cmd, int len)
 				if (qstate == GDB_STATE_STOPPED)
 					break;
 			}
+
+			u32 hb_after = shm_read32(GDB_SHM_OFF_PPC_HEARTBEAT);
+			u32 seen_after = shm_read32(GDB_SHM_OFF_PPC_HALT_SEEN);
+			u32 halt_after = shm_read32(GDB_SHM_OFF_HALT_REQ);
+			gdb_dbg_ppc_hb = hb_after;
+			gdb_dbg_ppc_seen = seen_after;
+			gdb_dbg_shm_halt = halt_after;
+			gdb_dbg_shm_state = qstate;
+			/* Store hb_before in an unused debug field for comparison */
+			gdb_dbg_last_poll = (s32)hb_before;
 
 			if (qstate != GDB_STATE_STOPPED)
 			{

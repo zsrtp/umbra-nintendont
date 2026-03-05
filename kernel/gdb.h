@@ -33,6 +33,8 @@
 #define GDB_SHM_OFF_PPC_HEARTBEAT 0x1B4 /* PPC writes frame counter here */
 #define GDB_SHM_OFF_PPC_HALT_SEEN 0x1B8 /* PPC writes HALT_REQ value it reads */
 #define GDB_SHM_OFF_EXIT_REQ     0x1BC /* ARM sets 1 to request PPC game exit */
+#define GDB_SHM_OFF_IC_INVAL_CNT  0x1C0 /* Number of addrs to invalidate (0-8) */
+#define GDB_SHM_OFF_IC_INVAL_ADDR 0x1C4 /* Array of up to 8 PPC virtual addrs */
 
 s32 gdb_start(u16 port);
 

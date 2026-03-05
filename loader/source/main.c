@@ -742,9 +742,6 @@ int main(int argc, char **argv)
 		//only check SD on Wii VC
 		if(i == DEV_USB && isWiiVC)
 			break;
-		//skip slow USB init if SD already found
-		if(i == DEV_USB && foundOneDevice)
-			break;
 		//check SD and USB on Wii and WiiU
 		const WCHAR *devNameFF = MountDevice(i);
 		if (devNameFF && !foundOneDevice)

@@ -358,24 +358,11 @@ static int gdb_recv_packet(void)
 	u8 recv_cksum = (hex_val(c1) << 4) | hex_val(c2);
 	if (recv_cksum != cksum)
 	{
-		u8 nakbuf[25];
-		int ni = 0, bi;
-		nakbuf[ni++] = '-';
-		nakbuf[ni++] = hexchars[(tcp_last_recv_n >> 4) & 0xF];
-		nakbuf[ni++] = hexchars[tcp_last_recv_n & 0xF];
-		nakbuf[ni++] = hexchars[(len >> 4) & 0xF];
-		nakbuf[ni++] = hexchars[len & 0xF];
-		for (bi = 0; bi < 8; bi++)
+		if (!noack_mode)
 		{
-			u8 b = (bi < len) ? (u8)pkt_buf[bi] : 0;
-			nakbuf[ni++] = hexchars[(b >> 4) & 0xF];
-			nakbuf[ni++] = hexchars[b & 0xF];
+			u8 nak = '-';
+			tcp_send(&nak, 1);
 		}
-		nakbuf[ni++] = hexchars[(cksum >> 4) & 0xF];
-		nakbuf[ni++] = hexchars[cksum & 0xF];
-		nakbuf[ni++] = hexchars[(recv_cksum >> 4) & 0xF];
-		nakbuf[ni++] = hexchars[recv_cksum & 0xF];
-		tcp_send(nakbuf, ni);
 		return 0;
 	}
 
@@ -589,10 +576,27 @@ static int write_single_reg(int regnum, const char *hex)
 	}
 }
 
+static int ppc_addr_valid(u32 pa, int len)
+{
+	u32 end = pa + len;
+	/* MEM1: 0x00000000-0x017FFFFF (24MB) */
+	if (pa < 0x01800000 && end <= 0x01800000)
+		return 1;
+	/* MEM2: 0x10000000-0x13FFFFFF (64MB) */
+	if (pa >= 0x10000000 && end <= 0x14000000)
+		return 1;
+	return 0;
+}
+
 static int gdb_read_mem(u32 addr, int len, char *hex)
 {
 	int i;
 	u32 pa = ppc_to_phys(addr);
+	if (!ppc_addr_valid(pa, len))
+	{
+		/* Return error for invalid addresses instead of risking ARM abort */
+		return -1;
+	}
 	sync_before_read((void*)pa, len);
 	for (i = 0; i < len; i++)
 	{
@@ -626,6 +630,11 @@ static int gdb_write_mem(u32 addr, const char *hex, int len)
 		write32(aligned, word);
 		sync_after_write((void*)aligned, 4);
 	}
+	/* Invalidate icache for the written range in case GDB patched code.
+	 * Without this, PPC may execute stale instructions from L1/L2 icache. */
+	ic_inval_add(addr);
+	if (len > 4)
+		ic_inval_add(addr + len - 1);
 	return 0;
 }
 
@@ -650,8 +659,12 @@ static void do_continue(void)
 			{
 				mdelay(1);
 				if (++step_wait > 3000)
-					break;  /* 3s timeout — avoid infinite hang */
+				{
+					gdb_dbg_shm_state = 0xDEAD0001; /* step-past timeout */
+					break;
+				}
 			}
+			gdb_dbg_client_polls = (u32)step_wait; /* track step-past duration */
 		}
 
 		write32(pa, PPC_TRAP_INSN);
@@ -672,22 +685,46 @@ static void do_step(void)
 	{
 		write32(pa, orig_insn);
 		sync_after_write((void*)pa, 4);
+		ic_inval_add(pc);
 	}
 
 	shm_write32(GDB_SHM_OFF_STATE, GDB_STATE_STEP);
 
+	/* Re-insert breakpoint after PPC completes the step.
+	 * Wait for STATE=STOPPED, then write the trap back. */
 	if (bp_at_addr(pc, NULL))
 	{
+		int step_wait = 0;
+		while (shm_read32(GDB_SHM_OFF_STATE) != GDB_STATE_STOPPED)
+		{
+			mdelay(1);
+			if (++step_wait > 3000)
+				break;
+		}
+
+		write32(pa, PPC_TRAP_INSN);
+		sync_after_write((void*)pa, 4);
+		ic_inval_add(pc);
 	}
 }
 
 static void make_stop_reply(char *buf)
 {
 	u32 sig = shm_read32(GDB_SHM_OFF_SIGNAL);
-	buf[0] = 'S';
+	/* Use T reply with thread info so cppdbg can track thread 1 */
+	buf[0] = 'T';
 	buf[1] = hexchars[(sig >> 4) & 0xF];
 	buf[2] = hexchars[sig & 0xF];
-	buf[3] = 0;
+	buf[3] = 't';
+	buf[4] = 'h';
+	buf[5] = 'r';
+	buf[6] = 'e';
+	buf[7] = 'a';
+	buf[8] = 'd';
+	buf[9] = ':';
+	buf[10] = '1';
+	buf[11] = ';';
+	buf[12] = 0;
 }
 
 static int gdb_handle_command(const char *cmd, int len)
@@ -831,7 +868,10 @@ static int gdb_handle_command(const char *cmd, int len)
 		if (mlen > (GDB_PKT_BUF_SIZE - 1) / 2)
 			mlen = (GDB_PKT_BUF_SIZE - 1) / 2;
 		int n = gdb_read_mem(addr, mlen, reply);
-		gdb_send_packet(reply, n);
+		if (n < 0)
+			gdb_send_str("E14");
+		else
+			gdb_send_packet(reply, n);
 		break;
 	}
 
@@ -861,7 +901,7 @@ static int gdb_handle_command(const char *cmd, int len)
 			shm_write32(GDB_SHM_OFF_PC, addr);
 		}
 		do_continue();
-		break;
+		return 2; /* enter continue-wait loop */
 	}
 
 	case 's':
@@ -873,7 +913,7 @@ static int gdb_handle_command(const char *cmd, int len)
 			shm_write32(GDB_SHM_OFF_PC, addr);
 		}
 		do_step();
-		break;
+		return 2; /* enter continue-wait loop */
 	}
 
 	case 'Z':
@@ -1054,32 +1094,50 @@ static u32 GDBServerThread(void *arg)
 				break;
 			}
 
-			u32 state = shm_read32(GDB_SHM_OFF_STATE);
-			if (state == GDB_STATE_RESUME || state == GDB_STATE_STEP)
+			/* r == 2: continue/step/halt — enter wait loop.
+			 * Use explicit return value instead of reading STATE
+			 * to avoid race where PPC changes STATE between
+			 * do_continue() setting RESUME and us reading it. */
+			if (r == 2)
 			{
 				flush_pending_ack();
+				gdb_dbg_state = 7; /* in continue-wait */
 				while (gdb_running)
 				{
-					state = shm_read32(GDB_SHM_OFF_STATE);
+					u32 state = shm_read32(GDB_SHM_OFF_STATE);
 					if (state == GDB_STATE_STOPPED)
 					{
-						char reply[4];
+						char reply[16];
 						make_stop_reply(reply);
 						gdb_send_str(reply);
+						gdb_dbg_state = 6; /* back to command loop */
 						break;
 					}
 
-					u8 cc;
-					int crc = tcp_recv_byte(&cc);
-					if (crc == 0 && cc == 0x03)
+					/* Use gdb_recv_packet instead of raw byte reads
+					 * to avoid consuming partial GDB packets and
+					 * desynchronizing the protocol stream. */
+					int wplen = gdb_recv_packet();
+					if (wplen < 0)
+					{
+						gdb_dbg_client_err = tcp_last_err;
+						gdb_dbg_state = 8; /* disconnected in wait */
+						detached = 1;
+						break;
+					}
+					if (wplen == 1 && pkt_buf[0] == 0x03)
 					{
 						shm_write32(GDB_SHM_OFF_MAGIC, GDB_SHM_MAGIC);
 						shm_write32(GDB_SHM_OFF_HALT_REQ, 1);
 					}
-					else if (crc == -1)
+					else if (wplen > 0)
 					{
-						detached = 1;
-						break;
+						/* Unexpected packet during continue — in
+						 * all-stop mode GDB should only send Ctrl-C.
+						 * Send empty response so GDB knows the
+						 * command is unsupported rather than silently
+						 * eating the packet. */
+						gdb_send_str("");
 					}
 
 					mdelay(10);
